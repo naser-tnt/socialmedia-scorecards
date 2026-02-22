@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+All_Generated_Scorecards/
+*.png
+*.html
+*.zip
+.DS_Store
+*.csv
+*.xlsx

@@ -16,12 +16,18 @@ import openpyxl
 # Force page configuration to be wide for better preview
 st.set_page_config(page_title="SocMedia Scorecards", layout="wide")
 
-# Try to import playwright, if not available user needs to install it
+# Try to import playwright, if not available try to install it (useful for Streamlit Cloud)
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
+    try:
+        subprocess.run(["pip", "install", "playwright"], check=True)
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        from playwright.sync_api import sync_playwright
+        PLAYWRIGHT_AVAILABLE = True
+    except Exception:
+        PLAYWRIGHT_AVAILABLE = False
 
 EXCLUDED_PLACES = {"opi orders"}
 EXCLUDED_STATUSES = {"cancelled", "rejected by place"}

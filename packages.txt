@@ -1,8 +1,17 @@
+chromium-browser
+chromium-chromedriver
 libgbm1
 libasound2
 libnss3
 libxcursor1
 libxss1
 libgtk-3-0
+libxcomposite1
+libxdamage1
+libxfixes3
+libxrandr2
+libatk1.0-0
+libatk-bridge2.0-0
+libx11-xcb1
 libdbus-glib-1-2
 libxtst6

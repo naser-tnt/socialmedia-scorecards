@@ -16,18 +16,34 @@ import openpyxl
 # Force page configuration to be wide for better preview
 st.set_page_config(page_title="SocMedia Scorecards", layout="wide")
 
-# Try to import playwright, if not available try to install it (useful for Streamlit Cloud)
+# Install Playwright + Chromium at startup (required for Streamlit Cloud)
+# This runs once when the app first boots.
+@st.cache_resource
+def _install_playwright():
+    """Ensure playwright and its chromium browser are available."""
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        subprocess.run(["pip", "install", "playwright"], check=True, capture_output=True)
+    try:
+        # Always attempt to install chromium — this is a no-op if already installed
+        result = subprocess.run(
+            ["playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            return False, result.stderr
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+_pw_ok, _pw_err = _install_playwright()
+
 try:
     from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
+    PLAYWRIGHT_AVAILABLE = _pw_ok
 except ImportError:
-    try:
-        subprocess.run(["pip", "install", "playwright"], check=True)
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-        from playwright.sync_api import sync_playwright
-        PLAYWRIGHT_AVAILABLE = True
-    except Exception:
-        PLAYWRIGHT_AVAILABLE = False
+    PLAYWRIGHT_AVAILABLE = False
 
 EXCLUDED_PLACES = {"opi orders"}
 EXCLUDED_STATUSES = {"cancelled", "rejected by place"}
@@ -413,7 +429,8 @@ st.title("📊 biteME Social Media Scorecard Automator")
 st.markdown("Upload the **Daily Orders CSV** and the **Score Card Tracking (.csv or .xlsx)** to generate premium PNG scorecards for all restaurants.")
 
 if not PLAYWRIGHT_AVAILABLE:
-    st.warning("⚠️ Playwright is not installed. PNG generation works via standard python backend, make sure `pip install playwright && playwright install chromium` was run.")
+    err_detail = f" **Error:** `{_pw_err}`" if _pw_err else ""
+    st.error(f"⚠️ Playwright/Chromium is not available on this server — scorecard images cannot be generated.{err_detail}")
 
 col1, col2 = st.columns(2)
 
@@ -500,43 +517,65 @@ if csv_file and tracker_file:
             progress_bar.progress((i + 1) / total)
             
         status_text.text("Compressing PNGs...")
-        
-        # Create Zip
-        zip_path = os.path.join(temp_dir, f"scorecards_{month_name}_week{week_num}.zip")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+
+        if generated_count == 0:
+            status_text.empty()
+            progress_bar.empty()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            st.error(
+                "❌ No scorecard images were generated. "
+                "This usually means Playwright/Chromium failed to launch on this server. "
+                + (f"Install error: {_pw_err}" if not PLAYWRIGHT_AVAILABLE else ""
+                   "Check server logs for details.")
+            )
+            st.stop()
+
+        # Build zip in memory — avoids any filesystem/cleanup race conditions on cloud
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, _, files in os.walk(png_dir):
                 for file in files:
-                    zipf.write(os.path.join(root, file), arcname=file)
-                    
+                    file_path = os.path.join(root, file)
+                    with open(file_path, 'rb') as fp:
+                        zipf.writestr(file, fp.read())
+        zip_buffer.seek(0)
+        zip_bytes = zip_buffer.getvalue()
+
         status_text.empty()
         progress_bar.empty()
-        
-        with open(zip_path, "rb") as f:
-            zip_bytes = f.read()
-            
-        st.balloons()
-        st.success(f"🎉 Generated {generated_count} scorecards successfully!")
-        
-        st.download_button(
-            label="📦 Download All Scorecards (.zip)",
-            data=zip_bytes,
-            file_name=f"Social_Media_Scorecards_{month_name}_Week_{week_num}.zip",
-            mime="application/zip",
-            type="primary",
-            use_container_width=True
-        )
-        
-        st.markdown("### 👀 Previews")
-        cols = st.columns(min(len(preview_htmls), 2))
-        for i, (name, html) in enumerate(preview_htmls[:2]):
-            with cols[i]:
-                st.components.v1.html(html, height=750, scrolling=True)
-        
-        if len(preview_htmls) > 2:
-            cols2 = st.columns(2)
-            for i, (name, html) in enumerate(preview_htmls[2:4]):
-                with cols2[i]:
-                    st.components.v1.html(html, height=750, scrolling=True)
 
-        # Cleanup temp
+        st.session_state['zip_bytes'] = zip_bytes
+        st.session_state['month_name'] = month_name
+        st.session_state['week_num'] = week_num
+        st.session_state['preview_htmls'] = preview_htmls
+        st.session_state['generated_count'] = generated_count
+
+        # Cleanup temp dir after bytes are safely in session state
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+if 'zip_bytes' in st.session_state:
+    st.balloons()
+    st.success(f"🎉 Generated {st.session_state['generated_count']} scorecards successfully!")
+    
+    st.download_button(
+        label="📦 Download All Scorecards (.zip)",
+        data=st.session_state['zip_bytes'],
+        file_name=f"Social_Media_Scorecards_{st.session_state['month_name']}_Week_{st.session_state['week_num']}.zip",
+        mime="application/zip",
+        type="primary",
+        use_container_width=True
+    )
+    
+    st.markdown("### 👀 Previews")
+    preview_htmls = st.session_state['preview_htmls']
+    cols = st.columns(min(len(preview_htmls), 2))
+    for i, (name, html) in enumerate(preview_htmls[:2]):
+        with cols[i]:
+            st.components.v1.html(html, height=750, scrolling=True)
+    
+    if len(preview_htmls) > 2:
+        cols2 = st.columns(2)
+        for i, (name, html) in enumerate(preview_htmls[2:4]):
+            with cols2[i]:
+                st.components.v1.html(html, height=750, scrolling=True)
+

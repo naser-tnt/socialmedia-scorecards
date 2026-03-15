@@ -228,8 +228,19 @@ def determine_week(orders):
     week_num = ((week_start.day - 1) // 7) + 1
     return week_start, month_name, year, week_num
 
-def generate_html(restaurant_data, daily_orders, month_name, year, week_num):
-    """Generate the scorecard HTML for one restaurant strictly sized at 1000x1200."""
+# ── Read logo SVG once at module level — not once per restaurant ────────────
+_SVG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "B n B.svg")
+try:
+    with open(_SVG_PATH, "r", encoding="utf-8") as _f:
+        _LOGO_SVG = _f.read()
+except Exception:
+    _LOGO_SVG = '<div style="font-size:24px;font-weight:900;color:#dc3545">biteME | tatbeeqi</div>'
+
+def generate_html(restaurant_data, daily_orders, month_name, year, week_num, svg_content=None):
+    """Generate the scorecard HTML for one restaurant sized at 1000x1200.
+    svg_content is pre-loaded once at module level to avoid repeated disk reads."""
+    if svg_content is None:
+        svg_content = _LOGO_SVG
     name = restaurant_data["display_name"].upper()
     stories = restaurant_data["stories"]
     ig = restaurant_data["ig"]
@@ -279,13 +290,7 @@ def generate_html(restaurant_data, daily_orders, month_name, year, week_num):
     else:
         score_color = "#dc3545"
 
-    import os
-    svg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "B n B.svg")
-    try:
-        with open(svg_path, "r", encoding="utf-8") as f:
-            svg_content = f.read()
-    except Exception:
-        svg_content = '<div style="font-size:24px;font-weight:900;color:#dc3545">biteME | tatbeeqi</div>'
+    # svg_content is now passed in (pre-loaded once at module level)
 
     html = f'''<!DOCTYPE html>
 <html>
@@ -398,28 +403,49 @@ def generate_html(restaurant_data, daily_orders, month_name, year, week_num):
 </html>'''
     return html
 
-def html_to_png(html_path, png_path):
-    """Convert HTML file to PNG using chromium headless browser directly to ensure consistent results"""
-    abs_html = os.path.abspath(html_path)
-    abs_png = os.path.abspath(png_path)
-    
-    # Using python-playwright API directly
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            # Launch with viewport big enough to contain the 1000x1200 card safely with some body padding margins
-            page = browser.new_page(viewport={"width": 1100, "height": 1300})
-            page.goto(f"file://{abs_html}")
-            # wait a small amount to make sure fonts are loaded
-            page.wait_for_timeout(200)
-            elem = page.locator(".card")
-            elem.screenshot(path=abs_png)
-            browser.close()
-        return True
-    except Exception as e:
-        print(f"Error rendering {png_path}: {e}")
-        return False
+def render_all_scorecards(jobs, png_dir, status_text, progress_bar):
+    """
+    Render all scorecards in a single Chromium session.
+
+    jobs: list of (norm_name, data, orders_per_day, safe_filename, html_string)
+    Returns: (generated_count, preview_htmls)
+
+    Key optimisations vs the old html_to_png():
+      - Chromium is launched ONCE for the entire batch (was once per restaurant)
+      - HTML is pushed via page.set_content() — no temp HTML files written to disk
+      - page.wait_for_load_state('domcontentloaded') replaces a fixed 200ms sleep
+      - A single Page object is reused across all restaurants (navigate, screenshot, repeat)
+    """
+    from playwright.sync_api import sync_playwright
+
+    generated_count = 0
+    preview_htmls = []
+    total = len(jobs)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1100, "height": 1300})
+
+        for i, (norm_name, data, orders_per_day, safe, html) in enumerate(jobs):
+            status_text.text(f"Rendering: {data['display_name']} ({i + 1}/{total})")
+
+            try:
+                # Feed HTML directly — no file:// round-trip needed
+                page.set_content(html, wait_until="domcontentloaded")
+                png_path = os.path.join(png_dir, f"{safe}.png")
+                page.locator(".card").screenshot(path=png_path)
+                generated_count += 1
+            except Exception as e:
+                print(f"Error rendering {data['display_name']}: {e}")
+
+            if len(preview_htmls) < 4:
+                preview_htmls.append((data["display_name"], html))
+
+            progress_bar.progress((i + 1) / total)
+
+        browser.close()
+
+    return generated_count, preview_htmls
 
 # --------------------------------------------------------------------------------
 # STREAMLIT UI
@@ -523,39 +549,28 @@ if csv_file and tracker_file:
         # Generate the images
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
-        # Temp dir for files
+
+        # Only a PNG output dir needed — no html_dir (HTML is passed directly to Playwright)
         temp_dir = tempfile.mkdtemp()
-        html_dir = os.path.join(temp_dir, "html")
         png_dir = os.path.join(temp_dir, "scorecards")
-        os.makedirs(html_dir, exist_ok=True)
         os.makedirs(png_dir, exist_ok=True)
-        
-        total = len(sorted_restaurants)
-        generated_count = 0
-        
-        preview_htmls = []
-        
-        for i, (norm_name, data) in enumerate(sorted_restaurants):
-            status_text.text(f"Generating scorecard for: {data['display_name']} ({i+1}/{total})")
-            
+
+        # Pre-build all job tuples (HTML generation is pure Python — fast)
+        # Logo SVG is read once (_LOGO_SVG module-level constant) and shared across all cards
+        jobs = []
+        for norm_name, data in sorted_restaurants:
             orders_per_day = daily_counts.get(norm_name, [0] * 7)
-            safe = "".join(c for c in data["display_name"] if c.isalnum() or c in " -_").strip().replace(" ", "_")
-            
-            html = generate_html(data, orders_per_day, month_name, year, week_num)
-            html_path = os.path.join(html_dir, f"{safe}.html")
-            png_path = os.path.join(png_dir, f"{safe}.png")
-            
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            
-            if len(preview_htmls) < 4:
-                preview_htmls.append((data['display_name'], html))
-                
-            if html_to_png(html_path, png_path):
-                generated_count += 1
-                
-            progress_bar.progress((i + 1) / total)
+            safe = "".join(
+                c for c in data["display_name"] if c.isalnum() or c in " -_"
+            ).strip().replace(" ", "_")
+            html = generate_html(data, orders_per_day, month_name, year, week_num,
+                                 svg_content=_LOGO_SVG)
+            jobs.append((norm_name, data, orders_per_day, safe, html))
+
+        # Render all cards in ONE Chromium session
+        generated_count, preview_htmls = render_all_scorecards(
+            jobs, png_dir, status_text, progress_bar
+        )
             
         status_text.text("Compressing PNGs...")
 

@@ -454,26 +454,67 @@ if csv_file and tracker_file:
                 
                 # Determine dates
                 week_start, month_name, year, week_num = determine_week(orders)
-                
+
                 # Match names
                 order_norms = set(o["norm"] for o in orders)
-                name_map = build_name_map(order_norms, set(scorecard.keys()))
-                
+                scorecard_norms = set(scorecard.keys())
+                name_map = build_name_map(order_norms, scorecard_norms)
+
+                # ── Matching diagnostics ─────────────────────────────────────
+                # Names from orders that matched a scorecard entry (exact or fuzzy)
+                matched_order_norms = set(name_map.keys())
+                # Names from orders that found NO scorecard entry at all
+                unmatched_in_orders = sorted(
+                    [o["place"] for o in orders if o["norm"] not in matched_order_norms],
+                    key=str.lower
+                )
+                # Deduplicate while preserving order
+                seen = set(); unmatched_in_orders_dedup = []
+                for n in unmatched_in_orders:
+                    k = n.lower()
+                    if k not in seen:
+                        seen.add(k); unmatched_in_orders_dedup.append(n)
+                unmatched_in_orders = unmatched_in_orders_dedup
+
+                # Scorecard entries that no order was ever mapped to
+                mapped_scorecard_norms = set(name_map.values())
+                unmatched_in_scorecard = sorted(
+                    [data["display_name"] for norm, data in scorecard.items() if norm not in mapped_scorecard_norms],
+                    key=str.lower
+                )
+
+                # Fuzzy/substring matches (not exact key–key matches)
+                fuzzy_matches = [
+                    (orders_place, scorecard_norms_val)
+                    for orders_place, scorecard_norms_val in name_map.items()
+                    if orders_place != scorecard_norms_val
+                ]
+                # Build display-friendly fuzzy pairs using original display names
+                # (we need the original order place name, not the norm)
+                order_norm_to_display = {}
+                for o in orders:
+                    order_norm_to_display.setdefault(o["norm"], o["place"])
+                fuzzy_display = [
+                    (order_norm_to_display.get(on, on), scorecard.get(sn, {}).get("display_name", sn))
+                    for on, sn in fuzzy_matches
+                ]
+                # ─────────────────────────────────────────────────────────────
+
                 # Count
                 daily_counts = count_orders_by_day(orders, name_map, week_start)
-                
-                # Sort exactly like what the user wanted: if they have orders, they appear;
+
                 # Sort: restaurants with orders first, then alphabetically
                 active_restaurants_in_csv = set(name_map.values())
                 sorted_restaurants = sorted(
                     scorecard.items(),
                     key=lambda x: (
-                        0 if x[0] in active_restaurants_in_csv and sum(daily_counts.get(x[0], [0])) > 0 else 1, 
+                        0 if x[0] in active_restaurants_in_csv and sum(daily_counts.get(x[0], [0])) > 0 else 1,
                         x[1]["display_name"]
                     )
                 )
 
                 st.success(f"✅ Successfully compiled {len(sorted_restaurants)} restaurants for {month_name} Week {week_num}")
+
                 
             except Exception as e:
                 st.error(f"Error parsing data: {e}")
@@ -549,6 +590,9 @@ if csv_file and tracker_file:
         st.session_state['week_num'] = week_num
         st.session_state['preview_htmls'] = preview_htmls
         st.session_state['generated_count'] = generated_count
+        st.session_state['unmatched_in_orders'] = unmatched_in_orders
+        st.session_state['unmatched_in_scorecard'] = unmatched_in_scorecard
+        st.session_state['fuzzy_display'] = fuzzy_display
 
         # Cleanup temp dir after bytes are safely in session state
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -556,7 +600,7 @@ if csv_file and tracker_file:
 if 'zip_bytes' in st.session_state:
     st.balloons()
     st.success(f"🎉 Generated {st.session_state['generated_count']} scorecards successfully!")
-    
+
     st.download_button(
         label="📦 Download All Scorecards (.zip)",
         data=st.session_state['zip_bytes'],
@@ -565,17 +609,110 @@ if 'zip_bytes' in st.session_state:
         type="primary",
         use_container_width=True
     )
-    
+
+    # ── Name Matching Report ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🔍 Name Matching Report")
+    st.caption(
+        "This report shows which restaurant names couldn't be linked between the two files. "
+        "Fix spelling differences in either file to ensure orders are counted correctly."
+    )
+
+    unmatched_orders    = st.session_state.get('unmatched_in_orders', [])
+    unmatched_scorecard = st.session_state.get('unmatched_in_scorecard', [])
+    fuzzy_display       = st.session_state.get('fuzzy_display', [])
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown(
+            f"""
+            <div style="background:#fff3cd;border-left:4px solid #ffc107;
+                        padding:14px 18px;border-radius:6px;margin-bottom:8px;">
+                <b style="font-size:15px;">⚠️ In Orders CSV — no Scorecard match</b><br>
+                <span style="font-size:12px;color:#666;">These restaurant names appear in the orders file
+                but couldn't be linked to any entry in the scorecard.
+                Their orders were <u>not counted</u>.</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        if unmatched_orders:
+            for name in unmatched_orders:
+                st.markdown(
+                    f'<div style="padding:6px 12px;margin:3px 0;background:#fff8e6;'
+                    f'border-radius:4px;font-size:14px;">❌  {name}</div>',
+                    unsafe_allow_html=True
+                )
+        else:
+            st.success("All order names were matched ✓")
+
+    with col_b:
+        st.markdown(
+            f"""
+            <div style="background:#f8d7da;border-left:4px solid #dc3545;
+                        padding:14px 18px;border-radius:6px;margin-bottom:8px;">
+                <b style="font-size:15px;">⚠️ In Scorecard — no Orders match</b><br>
+                <span style="font-size:12px;color:#666;">These entries exist in the scorecard
+                but no orders in the CSV were linked to them.
+                Their bar chart will show <u>all zeros</u>.</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        if unmatched_scorecard:
+            for name in unmatched_scorecard:
+                st.markdown(
+                    f'<div style="padding:6px 12px;margin:3px 0;background:#fdf0f0;'
+                    f'border-radius:4px;font-size:14px;">❌  {name}</div>',
+                    unsafe_allow_html=True
+                )
+        else:
+            st.success("All scorecard entries were matched ✓")
+
+    if fuzzy_display:
+        st.markdown(
+            """
+            <div style="background:#e8f4fd;border-left:4px solid #0d6efd;
+                        padding:14px 18px;border-radius:6px;margin:12px 0 8px;">
+                <b style="font-size:15px;">🔗 Auto-matched names (fuzzy / partial)</b><br>
+                <span style="font-size:12px;color:#666;">These names were linked automatically because
+                they looked similar. Review to make sure the pairing is correct.</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        rows_html = "".join(
+            f'<tr><td style="padding:7px 14px;border-bottom:1px solid #dee2e6;'
+            f'font-size:13px;">{order_name}</td>'
+            f'<td style="padding:7px 14px;border-bottom:1px solid #dee2e6;'
+            f'font-size:13px;">→</td>'
+            f'<td style="padding:7px 14px;border-bottom:1px solid #dee2e6;'
+            f'font-size:13px;">{sc_name}</td></tr>'
+            for order_name, sc_name in sorted(fuzzy_display, key=lambda x: x[0].lower())
+        )
+        st.markdown(
+            f'<table style="width:100%;border-collapse:collapse;background:#f0f8ff;'
+            f'border-radius:6px;overflow:hidden;">'
+            f'<thead><tr>'
+            f'<th style="padding:8px 14px;background:#dbeafe;text-align:left;font-size:13px;">Orders CSV Name</th>'
+            f'<th style="padding:8px 14px;background:#dbeafe;"></th>'
+            f'<th style="padding:8px 14px;background:#dbeafe;text-align:left;font-size:13px;">Scorecard Name</th>'
+            f'</tr></thead><tbody>{rows_html}</tbody></table>',
+            unsafe_allow_html=True
+        )
+    st.markdown("---")
+    # ── End Matching Report ─────────────────────────────────────────────────
+
     st.markdown("### 👀 Previews")
     preview_htmls = st.session_state['preview_htmls']
     cols = st.columns(min(len(preview_htmls), 2))
     for i, (name, html) in enumerate(preview_htmls[:2]):
         with cols[i]:
             st.components.v1.html(html, height=750, scrolling=True)
-    
+
     if len(preview_htmls) > 2:
         cols2 = st.columns(2)
         for i, (name, html) in enumerate(preview_htmls[2:4]):
             with cols2[i]:
                 st.components.v1.html(html, height=750, scrolling=True)
-
